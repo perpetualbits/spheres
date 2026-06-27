@@ -1,41 +1,45 @@
-//! Navigation state machine.
+//! Navigation state machine (id-keyed).
 //!
-//! Where you are is a `path` (the child indices taken from the root) plus an
-//! optional in-flight `Transition`. The whole gesture rides one eased scalar
-//! `t` in [0, 1] from the reused [`Eversion`]:
+//! Where you are is a `trail` of node ids (your history, NOT structural
+//! parentage) plus an optional in-flight `Transition`. The empty trail is the
+//! global OVERVIEW. The gesture rides one eased scalar `t` in [0, 1] from the
+//! reused [`Eversion`]:
 //!
-//! * `t = 0` — resting in the OUTER (parent) world, looking at its spheres.
-//! * `t = 1` — resting INSIDE the target child, looking at its spheres.
+//! * `t = 0` — resting in the OUTER world (overview, or the node at `trail`).
+//! * `t = 1` — resting INSIDE the target node.
 //!
-//! Entering animates 0 -> 1 then commits (push the child onto the path).
-//! Surfacing animates 1 -> 0 then commits (pop). The crucial property: **Esc
-//! always drives `t` toward 0**, so "surface out" is reliable from any state —
-//! resting, or mid-dive (which simply reverses, landing one level up).
+//! Esc always drives `t` toward 0, so surfacing out is reliable from any state
+//! (resting or mid-dive). Crucially, the *contents* of a node's world are a
+//! pure function of its id (see `scene`/`graph`), never of the trail — so
+//! reaching `core` two ways lands in the identical world (convergence).
 
 use crate::eversion::Eversion;
-use crate::world;
+use crate::graph::{Graph, NodeId};
+
+/// The world you are resting in (or the OUTER world of a transition).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum World {
+    /// The pulled-back global graph.
+    Overview,
+    /// Inside a node's local world (its neighbours).
+    Node(NodeId),
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Dir {
-    /// Diving into `target`; on completion the child is committed onto the path.
     In,
-    /// Surfacing; on completion the transition simply ends (the pop, if any,
-    /// already happened when the surface began).
     Out,
 }
 
 #[derive(Copy, Clone)]
 pub struct Transition {
-    /// Index (within the OUTER/parent world) of the sphere being entered/left.
-    pub target: usize,
+    /// Node being entered/left.
+    pub target: NodeId,
     pub dir: Dir,
 }
 
 pub struct Nav {
-    /// Committed depth: the OUTER world's path at all times (during a dive the
-    /// target is not pushed until completion; during a surface it is already
-    /// popped).
-    path: Vec<usize>,
+    trail: Vec<NodeId>,
     transition: Option<Transition>,
     eversion: Eversion,
 }
@@ -43,7 +47,7 @@ pub struct Nav {
 impl Nav {
     pub fn new() -> Self {
         Nav {
-            path: Vec::new(),
+            trail: Vec::new(),
             transition: None,
             eversion: Eversion::new(),
         }
@@ -51,45 +55,71 @@ impl Nav {
 
     // --- queries ---------------------------------------------------------
 
-    /// The OUTER world's path (parent during a transition, else the current
-    /// world).
-    pub fn path(&self) -> &[usize] {
-        &self.path
+    /// The OUTER world (current resting world, or the parent during a dive).
+    pub fn outer(&self) -> World {
+        match self.trail.last() {
+            None => World::Overview,
+            Some(&id) => World::Node(id),
+        }
     }
 
     pub fn transition(&self) -> Option<Transition> {
         self.transition
     }
 
-    /// Committed depth (number of levels below root).
     pub fn depth(&self) -> usize {
-        self.path.len()
+        self.trail.len()
     }
 
-    /// Eased transition progress in [0, 1].
     pub fn eased(&self) -> f32 {
         self.eversion.eased()
     }
 
-    /// True while a gesture is mid-flight — this is the worst-case frame the
-    /// HUD's budget counter watches.
     pub fn is_everting(&self) -> bool {
         self.transition.is_some()
     }
 
-    /// Human-readable trail, e.g. "Root > Amber > Azure", with "→ Emerald"
-    /// appended while diving in.
-    pub fn breadcrumb(&self) -> String {
-        let mut s = String::from("Root");
-        for &idx in &self.path {
-            s.push_str(" > ");
-            s.push_str(world::color_name(idx));
+    /// The node currently in focus (target of a dive, else the resting node).
+    pub fn focus_node(&self) -> Option<NodeId> {
+        match self.transition {
+            Some(t) => Some(t.target),
+            None => self.trail.last().copied(),
         }
-        if let Some(tr) = self.transition {
-            match tr.dir {
+    }
+
+    /// Resting camera distance for a world.
+    pub fn world_dist(world: World) -> f32 {
+        match world {
+            World::Overview => crate::config::OVERVIEW_DIST,
+            World::Node(_) => crate::config::LOCAL_DIST,
+        }
+    }
+
+    /// Eye distance for this frame, interpolating outer→inner across a dive,
+    /// minus the small forward bob.
+    pub fn eye_distance(&self) -> f32 {
+        let eased = self.eased();
+        let outer = Self::world_dist(self.outer());
+        let inner = match self.transition {
+            Some(t) => Self::world_dist(World::Node(t.target)),
+            None => outer,
+        };
+        let d = outer + (inner - outer) * eased;
+        d - crate::config::CAMERA_PUSH * (std::f32::consts::PI * eased).sin()
+    }
+
+    /// Breadcrumb trail, e.g. "overview > io > core" with "→ name" while diving.
+    pub fn breadcrumb(&self, graph: &Graph) -> String {
+        let mut s = String::from("overview");
+        for &id in &self.trail {
+            s.push_str(" > ");
+            s.push_str(graph.node(id).name);
+        }
+        if let Some(t) = self.transition {
+            match t.dir {
                 Dir::In => {
                     s.push_str("  →  ");
-                    s.push_str(world::color_name(tr.target));
+                    s.push_str(graph.node(t.target).name);
                 }
                 Dir::Out => s.push_str("  ↑"),
             }
@@ -97,10 +127,30 @@ impl Nav {
         s
     }
 
+    /// Background tint for the current context (Requirement 7).
+    pub fn ambient(&self, graph: &Graph) -> [f64; 4] {
+        let base = crate::config::CLEAR_OVERVIEW;
+        let Some(id) = self.focus_node() else {
+            return base;
+        };
+        // Skip while in the overview proper.
+        if self.depth() == 0 && self.transition.is_none() {
+            return base;
+        }
+        let tint = graph.node(id).kind.tint();
+        let s = crate::config::AMBIENT_TINT_STRENGTH;
+        [
+            base[0] + tint.x as f64 * s,
+            base[1] + tint.y as f64 * s,
+            base[2] + tint.z as f64 * s,
+            1.0,
+        ]
+    }
+
     // --- gestures --------------------------------------------------------
 
-    /// Enter child `target` of the current world. Ignored unless resting.
-    pub fn evert_in(&mut self, target: usize) {
+    /// Enter node `target`. Ignored unless resting.
+    pub fn evert_in(&mut self, target: NodeId) {
         if self.transition.is_none() {
             self.transition = Some(Transition {
                 target,
@@ -111,14 +161,11 @@ impl Nav {
         }
     }
 
-    /// Surface out exactly one level. Reliable from any state — this is the
-    /// most important interaction in the build.
+    /// Surface out one level. Reliable from any state.
     pub fn surface_out(&mut self) {
         match self.transition {
-            // Resting: pop one level and run the reverse transition from the
-            // fully-inside state.
             None => {
-                if let Some(last) = self.path.pop() {
+                if let Some(last) = self.trail.pop() {
                     self.transition = Some(Transition {
                         target: last,
                         dir: Dir::Out,
@@ -126,19 +173,16 @@ impl Nav {
                     self.eversion.reset_to(1.0);
                     self.eversion.evert_out();
                 }
-                // At root (empty path): nothing to surface to; no-op.
+                // At the overview: nothing above; no-op.
             }
-            // Mid-dive: reverse it. We never pushed, so completing at t = 0
-            // simply lands us back in the outer world — one level up from where
-            // the dive was heading.
             Some(tr) if tr.dir == Dir::In => {
+                // Reverse the dive (lands back in the outer world).
                 self.transition = Some(Transition {
                     target: tr.target,
                     dir: Dir::Out,
                 });
                 self.eversion.evert_out();
             }
-            // Already surfacing: leave it be.
             Some(_) => {}
         }
     }
@@ -147,18 +191,14 @@ impl Nav {
 
     pub fn update(&mut self, dt: f32) {
         self.eversion.update(dt);
-
         if let Some(tr) = self.transition {
             match tr.dir {
                 Dir::In if self.eversion.raw() >= 1.0 => {
-                    // Arrived inside: commit the descent.
-                    self.path.push(tr.target);
+                    self.trail.push(tr.target);
                     self.transition = None;
                     self.eversion.reset_to(0.0);
                 }
                 Dir::Out if self.eversion.raw() <= 0.0 => {
-                    // Back in the outer world (already popped, if this was a
-                    // real surface-out).
                     self.transition = None;
                     self.eversion.reset_to(0.0);
                 }

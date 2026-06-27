@@ -1,26 +1,31 @@
-//! Spheres — Phase 0.5.
+//! Spheres — Phase 0.6.
 //!
-//! A standalone wgpu/winit prototype of the recursive sphere desktop: glassy
-//! spheres hanging in space, each previewing the world inside it; click one to
-//! evert into it and arrive in a new space of child spheres; Esc to surface
-//! back out one level. NOT a compositor — it exists to test whether the
-//! recursion feels coherent and the world stays legible and navigable, while
-//! keeping a frame deadline through the (now populated) worst-case eversion.
+//! A standalone wgpu/winit prototype of the spatial/relational interface, now
+//! over a hand-authored graph of the "eno" project. NOT a compositor. The goal
+//! is "to BE somewhere": every node is a glassy sphere (a container you evert
+//! into), carrying a Saturn ring that reads out its data; nodes are linked by
+//! glowing edges so the global structure — core's centrality, the hidden
+//! cross-couplings, a person spanning libraries and tools — is visible at a
+//! glance. Nodes are keyed by stable id, so reaching one two ways converges on
+//! the same world.
 //!
 //! Controls:
-//!   left click            -> evert into the sphere under the cursor
+//!   left click            -> evert into the node under the cursor
 //!   right click / Esc     -> surface out one level (reliable from any state)
 //!   Q / window close      -> quit
+//!
+//! TODO (deferred): scroll/book leaf forms for individual files; an "act" mode;
+//! running the demo. CONFIG: default landing point is hardcoded production-first.
 
 mod camera;
 mod config;
 mod eversion;
+mod graph;
 mod hud;
 mod nav;
 mod render;
 mod scene;
 mod sphere;
-mod world;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -33,38 +38,30 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use camera::Camera;
+use graph::Graph;
 use hud::Hud;
 use nav::Nav;
 use render::Renderer;
 
-/// Everything that exists only once the window (and GPU surface) is alive.
 struct State {
     window: Arc<Window>,
     renderer: Renderer,
     camera: Camera,
+    graph: Graph,
     nav: Nav,
     hud: Hud,
 
     width: u32,
     height: u32,
-    /// Cursor in normalised device coords ([-1,1], y up); defaults to centre.
     cursor_ndc: (f32, f32),
 
     start: Instant,
     last_frame: Instant,
 
-    /// When set (via the `SPHERES_AUTODEMO` env var), dives and surfaces fire
-    /// themselves. Handy for headless frame-time capture of the populated
-    /// eversion without a mouse.
     auto_demo: bool,
     next_action: f32,
 
-    /// When set (via `SPHERES_CAPTURE=path`), render a few scripted frames to
-    /// `path.*.ppm` and exit. A compositor-independent way to actually see what
-    /// the GPU drew.
     capture_path: Option<String>,
-
-    /// `SPHERES_PERFLOG=1`: periodically log frame stats to stderr.
     perf_log: bool,
     frame_count: u64,
 }
@@ -81,6 +78,10 @@ impl State {
             window,
             renderer,
             camera,
+            graph: Graph::eno(),
+            // CONFIG: default landing point. Hardcoded production-first means we
+            // begin in the global overview with production available; a future
+            // config setting would let this start inside a chosen node.
             nav: Nav::new(),
             hud,
             width: w,
@@ -112,19 +113,18 @@ impl State {
         self.cursor_ndc = (x, y);
     }
 
-    /// Self-driving demo: dive deeper until AUTODEMO_MAX_DEPTH, then surface
-    /// all the way back, repeatedly — only acting while resting.
+    /// Self-driving demo: overview → production → core, then surface back, on a
+    /// timer. Acts only while resting.
     fn drive_auto_demo(&mut self, elapsed: f32) {
         if !self.auto_demo || elapsed < self.next_action || self.nav.is_everting() {
             return;
         }
-        if self.nav.depth() < config::AUTODEMO_MAX_DEPTH {
-            let target = (self.nav.depth() * 3 + 1) % config::SPHERES_PER_LEVEL;
-            self.nav.evert_in(target);
-        } else {
-            self.nav.surface_out();
+        match self.nav.depth() {
+            0 => self.nav.evert_in(self.graph.production()),
+            1 => self.nav.evert_in(0), // core is node 0
+            _ => self.nav.surface_out(),
         }
-        self.next_action = elapsed + 1.4;
+        self.next_action = elapsed + 1.5;
     }
 
     fn frame(&mut self) {
@@ -141,10 +141,8 @@ impl State {
         self.nav.update(dt);
 
         self.hud.record(now, dt * 1000.0, self.nav.is_everting());
-        self.hud.set_nav(self.nav.depth(), self.nav.breadcrumb());
+        self.hud.set_nav(self.nav.depth(), self.nav.breadcrumb(&self.graph));
 
-        // Optional headless perf log (SPHERES_PERFLOG=1) — the same numbers the
-        // on-screen HUD shows, for measuring without reading the window.
         self.frame_count += 1;
         if self.perf_log && self.frame_count % 120 == 0 {
             let (last, fps, max) = self.hud.snapshot();
@@ -157,53 +155,80 @@ impl State {
             );
         }
 
-        let frame = scene::build(&self.nav, &self.camera, time, self.cursor_ndc);
+        let eye_z = self.nav.eye_distance();
+        let view_proj = self.camera.view_proj(eye_z);
+        let frame = scene::build(&self.graph, &self.nav, &self.camera, time, self.cursor_ndc);
+        self.hud.set_world_labels(frame.labels, view_proj);
 
         self.renderer.render(
             &self.camera,
-            self.nav.eased(),
+            eye_z,
             time,
-            &frame.opaque,
-            &frame.glass,
+            frame.clear,
+            &frame.nodes,
+            &frame.rings,
+            &frame.edges,
             &mut self.hud,
             false,
         );
     }
 
-    /// Render a few scripted frames to PPM files and exit. Compositor-
-    /// independent visual verification of what the GPU actually drew.
+    /// Render scripted frames to PPM and exit. Notably captures `core` reached
+    /// two ways to demonstrate id-keyed convergence.
     fn run_capture(&mut self) -> ! {
         let base = self.capture_path.clone().unwrap();
+        let core = 0;
+        let production = self.graph.production();
+        let io = self.graph.nodes.iter().position(|n| n.name == "io").unwrap();
 
-        // 1) Resting at the root: the populated, glassy, legible scene.
+        // 1) The global overview — the structure.
         self.nav = Nav::new();
-        self.shoot(&format!("{base}.root.ppm"), 2.0);
+        self.shoot(&format!("{base}.overview.ppm"));
 
-        // 2) Fully inside child 3: a fresh world of its own children.
+        // 2) Inside production.
         self.nav = Nav::new();
-        self.nav.evert_in(3);
-        self.nav.update(10.0); // run to completion (commits the descent)
-        self.shoot(&format!("{base}.inside.ppm"), 2.0);
+        self.nav.evert_in(production);
+        self.nav.update(10.0);
+        self.shoot(&format!("{base}.production.ppm"));
 
-        // 3) Mid-eversion into child 2: the worst-case frame, caught halfway.
+        // 3) core reached via production.
+        self.nav.evert_in(core);
+        self.nav.update(10.0);
+        self.shoot(&format!("{base}.core-via-production.ppm"));
+
+        // 4) core reached via io — MUST be the same world (convergence).
         self.nav = Nav::new();
-        self.nav.evert_in(2);
+        self.nav.evert_in(io);
+        self.nav.update(10.0);
+        self.nav.evert_in(core);
+        self.nav.update(10.0);
+        self.shoot(&format!("{base}.core-via-io.ppm"));
+
+        // 5) Mid-eversion into core.
+        self.nav = Nav::new();
+        self.nav.evert_in(core);
         self.nav.update(0.5 * config::EVERSION_DURATION_MS / 1000.0);
-        self.shoot(&format!("{base}.evert.ppm"), 2.0);
+        self.shoot(&format!("{base}.evert.ppm"));
 
         std::process::exit(0);
     }
 
-    fn shoot(&mut self, path: &str, time: f32) {
+    fn shoot(&mut self, path: &str) {
+        let time = 2.0;
         self.hud.record(Instant::now(), 8.0, self.nav.is_everting());
-        self.hud.set_nav(self.nav.depth(), self.nav.breadcrumb());
-        let frame = scene::build(&self.nav, &self.camera, time, (0.0, 0.0));
+        self.hud.set_nav(self.nav.depth(), self.nav.breadcrumb(&self.graph));
+        let eye_z = self.nav.eye_distance();
+        let view_proj = self.camera.view_proj(eye_z);
+        let frame = scene::build(&self.graph, &self.nav, &self.camera, time, (0.0, 0.0));
+        self.hud.set_world_labels(frame.labels, view_proj);
         if let Some(img) = self.renderer.render(
             &self.camera,
-            self.nav.eased(),
+            eye_z,
             time,
-            &frame.opaque,
-            &frame.glass,
+            frame.clear,
+            &frame.nodes,
+            &frame.rings,
+            &frame.edges,
             &mut self.hud,
             true,
         ) {
@@ -211,8 +236,6 @@ impl State {
                 Ok(()) => log::info!("captured {} ({}x{})", path, img.width, img.height),
                 Err(e) => log::error!("capture write {path} failed: {e}"),
             }
-        } else {
-            log::error!("capture {path}: no frame acquired");
         }
     }
 }
@@ -236,13 +259,9 @@ impl ApplicationHandler for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("Spheres — Phase 0.5")
+            .with_title("Spheres — Phase 0.6")
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("failed to create window"),
-        );
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.state = Some(State::new(window));
     }
 
@@ -258,9 +277,7 @@ impl ApplicationHandler for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
-
             WindowEvent::CursorMoved { position, .. } => state.set_cursor(position),
 
             WindowEvent::MouseInput {
@@ -269,11 +286,14 @@ impl ApplicationHandler for App {
                 ..
             } => match button {
                 MouseButton::Left => {
-                    // Enter the sphere under the cursor (if any).
-                    if let Some(i) =
-                        scene::pick(&state.nav, &state.camera, state.cursor_ndc.0, state.cursor_ndc.1)
-                    {
-                        state.nav.evert_in(i);
+                    if let Some(id) = scene::pick(
+                        &state.graph,
+                        &state.nav,
+                        &state.camera,
+                        state.cursor_ndc.0,
+                        state.cursor_ndc.1,
+                    ) {
+                        state.nav.evert_in(id);
                     }
                 }
                 MouseButton::Right => state.nav.surface_out(),
@@ -289,13 +309,11 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => state.frame(),
-
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drive a continuous animation/measurement loop.
         if let Some(state) = self.state.as_ref() {
             state.window.request_redraw();
         }
@@ -304,10 +322,8 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::init();
-
     let event_loop = EventLoop::new().expect("create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-
     let mut app = App::default();
     event_loop.run_app(&mut app).expect("event loop");
 }

@@ -1,203 +1,299 @@
 //! Per-frame scene assembly.
 //!
-//! Turns the navigation state + the (deterministically generated) worlds into
-//! two instance lists for the renderer:
+//! Turns the graph + navigation state into the renderer's instance lists
+//! (node spheres, ring readouts, edge links) plus billboarded labels. Two
+//! kinds of "world" are drawn with the same primitives:
 //!
-//! * `opaque` — solid "preview cores" (miniatures of a sphere's own children,
-//!   seen through its glass) and orbiting moons.
-//! * `glass` — the translucent sphere shells, sorted back-to-front for correct
-//!   alpha blending.
-//!
-//! It also does cursor ray-picking (which sphere are we pointing at) and the
-//! hover "focus" factor that clears the glass on the sphere under the cursor.
+//! * the global OVERVIEW (depth 0) — every node at its fixed position, every
+//!   edge, so the structure (core's hub, the cross-couplings, a person's span)
+//!   is visible at a glance;
+//! * a node's LOCAL world — its neighbours laid out around you, edges radiating
+//!   from the centre. The layout is a pure function of the node's id, so the
+//!   same node reached two ways is the same world (convergence).
 
 use glam::Vec3;
 
 use crate::camera::Camera;
 use crate::config;
-use crate::nav::Nav;
-use crate::render::Instance;
-use crate::world::{Sphere, World};
+use crate::graph::{Graph, NodeId, Relation};
+use crate::hud::Label;
+use crate::nav::{Nav, World};
+use crate::render::{EdgeInstance, Instance, RingInstance};
 
 pub struct Frame {
-    pub opaque: Vec<Instance>,
-    pub glass: Vec<Instance>,
+    pub clear: [f64; 4],
+    pub nodes: Vec<Instance>,
+    pub rings: Vec<RingInstance>,
+    pub edges: Vec<EdgeInstance>,
+    pub labels: Vec<Label>,
 }
 
-/// Build the instance lists for this frame. `cursor` is normalised device
-/// coordinates ([-1,1], y up) of the mouse, used for the hover-clarity
-/// affordance.
-pub fn build(nav: &Nav, camera: &Camera, time: f32, cursor: (f32, f32)) -> Frame {
-    let mut opaque = Vec::new();
-    let mut glass = Vec::new();
+struct Placement {
+    id: NodeId,
+    pos: Vec3,
+    radius: f32,
+}
 
-    let dive = nav.eased();
-    let eye = camera.eye(dive);
-    let (ray_o, ray_d) = camera.ray(cursor.0, cursor.1);
+struct EdgeSpec {
+    a: Vec3,
+    b: Vec3,
+    rel: Relation,
+    from: Option<NodeId>,
+    to: Option<NodeId>,
+}
 
-    let outer = World::generate(nav.path());
-    let transition = nav.transition();
-    let target = transition.map(|t| t.target);
+pub fn build(graph: &Graph, nav: &Nav, camera: &Camera, time: f32, cursor: (f32, f32)) -> Frame {
+    let mut f = Frame {
+        clear: nav.ambient(graph),
+        nodes: Vec::new(),
+        rings: Vec::new(),
+        edges: Vec::new(),
+        labels: Vec::new(),
+    };
 
-    // Cross-fades between the outer and inner worlds.
-    let sibling_presence = 1.0 - smoothstep(dive, 0.0, 0.55); // outer fades out
-    let inner_presence = smoothstep(dive, 0.45, 1.0); // inner fades in
-    let shell_alpha = 1.0 - smoothstep(dive, 0.62, 1.0); // enveloping shell fades
-    let shell_ease = smoothstep(dive, 0.0, 1.0); // grow + recentre
+    let eased = nav.eased();
+    let eye_z = nav.eye_distance();
+    let (ray_o, ray_d) = camera.ray(eye_z, cursor.0, cursor.1);
 
-    for child in &outer.children {
-        if Some(child.index) == target {
-            // The target becomes the enveloping shell: recentre to the origin
-            // and grow out past the camera. Its "contents" are the inner-world
-            // children (added below), so it gets no preview cores.
-            let center = child.rest_pos.lerp(Vec3::ZERO, shell_ease);
-            let radius = lerp(child.radius, config::ENVELOP_RADIUS, shell_ease);
-            glass.push(Instance::new(
-                center,
-                radius,
-                child.tint,
-                shell_alpha,
-                dive, // evert amount drives the fold
-                1.0,  // fully clear: we are entering it
-                child.pattern,
-                time * child.spin,
-            ));
-        } else {
-            let presence = if transition.is_some() {
-                sibling_presence
-            } else {
-                1.0
-            };
-            if presence > 0.02 {
-                add_sphere(
-                    &mut glass,
-                    &mut opaque,
-                    nav.path(),
-                    child,
-                    child.rest_pos,
-                    presence,
-                    eye,
-                    ray_o,
-                    ray_d,
-                    time,
-                );
+    match nav.transition() {
+        None => {
+            // Resting: render the current world fully.
+            let world = nav.outer();
+            let placements = placements_of(graph, world);
+            let hovered = pick_placement(&placements, ray_o, ray_d);
+
+            for p in &placements {
+                let focus = if Some(p.id) == hovered { 1.0 } else { 0.0 };
+                push_node(&mut f, graph, p.id, p.pos, p.radius, 1.0, 0.0, focus, time, true);
+            }
+            if let World::Node(c) = world {
+                f.labels.push(center_label(graph, c));
+            }
+            let local = matches!(world, World::Node(_));
+            for es in edges_of(graph, world) {
+                let hot = hovered.is_some() && (es.from == hovered || es.to == hovered);
+                push_edge(&mut f, &es, edge_glow(es.rel, hot), 1.0);
+                // In a local world (few edges) name the relation at its midpoint.
+                if local {
+                    let c = es.rel.color();
+                    f.labels.push(Label {
+                        text: es.rel.label().to_string(),
+                        pos: es.a.lerp(es.b, 0.5),
+                        rgb: [c.x, c.y, c.z],
+                        alpha: 0.6,
+                    });
+                }
+            }
+        }
+        Some(tr) => {
+            // Eversion: outer world fades out, target grows to envelop, inner
+            // world fades in — exactly the resting inner world by t = 1.
+            let outer = nav.outer();
+            let sib = 1.0 - smoothstep(eased, 0.0, 0.55);
+            let shell_a = 1.0 - smoothstep(eased, 0.62, 1.0);
+            let inner_a = smoothstep(eased, 0.45, 1.0);
+            let shell_e = smoothstep(eased, 0.0, 1.0);
+
+            for p in placements_of(graph, outer) {
+                if p.id == tr.target {
+                    let center = p.pos.lerp(Vec3::ZERO, shell_e);
+                    let radius = lerp(p.radius, config::ENVELOP_RADIUS, shell_e);
+                    // The enveloping shell: no readout, drives the fold.
+                    push_node(&mut f, graph, p.id, center, radius, shell_a, eased, 1.0, time, false);
+                } else {
+                    push_node(&mut f, graph, p.id, p.pos, p.radius, sib, 0.0, 0.0, time, sib > 0.25);
+                }
+            }
+            for es in edges_of(graph, outer) {
+                // Skip edges touching the moving target; fade the rest.
+                if es.from == Some(tr.target) || es.to == Some(tr.target) {
+                    continue;
+                }
+                push_edge(&mut f, &es, edge_glow(es.rel, false), sib);
+            }
+
+            let inner = World::Node(tr.target);
+            for p in placements_of(graph, inner) {
+                let r = p.radius * inner_a.max(0.001);
+                push_node(&mut f, graph, p.id, p.pos, r, inner_a, 0.0, 0.0, time, inner_a > 0.4);
+            }
+            for es in edges_of(graph, inner) {
+                push_edge(&mut f, &es, edge_glow(es.rel, false), inner_a);
             }
         }
     }
 
-    // The inner world's children fade in at their resting positions, so by
-    // t = 1 the view is exactly the resting view of the world we entered.
-    if let Some(tg) = target {
-        if inner_presence > 0.02 {
-            let mut inner_path = nav.path().to_vec();
-            inner_path.push(tg);
-            let inner = World::generate(&inner_path);
-            for child in &inner.children {
-                add_sphere(
-                    &mut glass,
-                    &mut opaque,
-                    &inner_path,
-                    child,
-                    child.rest_pos,
-                    inner_presence,
-                    eye,
-                    ray_o,
-                    ray_d,
-                    time,
-                );
-            }
-        }
-    }
-
-    // Back-to-front for the transparent pass.
-    glass.sort_by(|a, b| {
-        let da = a.center().distance_squared(eye);
-        let db = b.center().distance_squared(eye);
-        db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    Frame { opaque, glass }
+    f
 }
 
-/// Add one resting glass sphere plus its preview cores and moons.
-#[allow(clippy::too_many_arguments)]
-fn add_sphere(
-    glass: &mut Vec<Instance>,
-    opaque: &mut Vec<Instance>,
-    world_path: &[usize],
-    sphere: &Sphere,
-    center: Vec3,
-    presence: f32,
-    eye: Vec3,
-    ray_o: Vec3,
-    ray_d: Vec3,
-    time: f32,
-) {
-    let radius = sphere.radius * presence;
-
-    // Hover clarity: how close the cursor ray passes to this sphere.
-    let focus = hover_focus(ray_o, ray_d, center, sphere.radius);
-
-    glass.push(Instance::new(
-        center,
-        radius,
-        sphere.tint,
-        presence, // alpha: fades the whole sphere in/out with presence
-        0.0,      // not everting
-        focus,
-        sphere.pattern,
-        time * sphere.spin,
-    ));
-
-    let _ = eye; // (reserved for future distance-based effects)
-
-    // Preview cores: miniatures of this sphere's OWN children, at their real
-    // relative positions, so the glass previews the world you would enter.
-    let mut child_path = world_path.to_vec();
-    child_path.push(sphere.index);
-    let inner = World::generate(&child_path);
-    for gc in inner.children.iter().take(config::PREVIEW_CORE_COUNT) {
-        // gc.rest_pos = dir * LAYOUT_RADIUS, so dividing recovers the unit
-        // direction; place it inside the parent at a shrunken radius.
-        let rel = gc.rest_pos / config::LAYOUT_RADIUS;
-        let pos = center + rel * (radius * config::PREVIEW_FILL);
-        let r = radius * config::PREVIEW_CORE_RADIUS_FRAC;
-        opaque.push(Instance::solid(pos, r, gc.tint));
-    }
-
-    // Orbiting moons — animated marks that aid at-a-glance identification.
-    for m in &sphere.moons {
-        let a = m.phase + time * m.speed;
-        let (sa, ca) = a.sin_cos();
-        let offset = Vec3::new(
-            m.orbit_radius * ca,
-            m.orbit_radius * sa * m.incline.cos(),
-            m.orbit_radius * sa * m.incline.sin(),
-        );
-        opaque.push(Instance::solid(center + offset, m.size * presence, m.tint));
-    }
-}
-
-/// Ray-pick the sphere under the cursor. Only meaningful while resting.
-pub fn pick(nav: &Nav, camera: &Camera, ndc_x: f32, ndc_y: f32) -> Option<usize> {
+/// Pick the node under the cursor in the current resting world (for clicks).
+pub fn pick(graph: &Graph, nav: &Nav, camera: &Camera, ndc_x: f32, ndc_y: f32) -> Option<NodeId> {
     if nav.is_everting() {
         return None;
     }
-    let (o, d) = camera.ray(ndc_x, ndc_y);
-    let world = World::generate(nav.path());
+    let (o, d) = camera.ray(nav.eye_distance(), ndc_x, ndc_y);
+    let placements = placements_of(graph, nav.outer());
+    pick_placement(&placements, o, d)
+}
 
-    let mut best: Option<(f32, usize)> = None;
-    for c in &world.children {
-        if let Some(t) = ray_sphere(o, d, c.rest_pos, c.radius * 1.05) {
+// --- world geometry ------------------------------------------------------
+
+fn placements_of(graph: &Graph, world: World) -> Vec<Placement> {
+    match world {
+        World::Overview => graph
+            .nodes
+            .iter()
+            .map(|n| Placement {
+                id: n.id,
+                pos: n.pos,
+                radius: n.radius(),
+            })
+            .collect(),
+        World::Node(c) => local_layout(graph, c)
+            .into_iter()
+            .map(|(id, _rel, pos)| Placement {
+                id,
+                pos,
+                radius: graph.node(id).radius(),
+            })
+            .collect(),
+    }
+}
+
+fn edges_of(graph: &Graph, world: World) -> Vec<EdgeSpec> {
+    match world {
+        World::Overview => graph
+            .edges
+            .iter()
+            .map(|e| EdgeSpec {
+                a: graph.node(e.from).pos,
+                b: graph.node(e.to).pos,
+                rel: e.rel,
+                from: Some(e.from),
+                to: Some(e.to),
+            })
+            .collect(),
+        World::Node(c) => local_layout(graph, c)
+            .into_iter()
+            .map(|(id, rel, pos)| EdgeSpec {
+                a: Vec3::ZERO, // edges radiate from "you" (the node you are in)
+                b: pos,
+                rel,
+                from: Some(c),
+                to: Some(id),
+            })
+            .collect(),
+    }
+}
+
+/// Deterministic layout of a node's neighbours around the origin. Pure
+/// function of the node id (and its neighbour set), so it is identical every
+/// visit — this is what makes id-keyed convergence visible.
+fn local_layout(graph: &Graph, c: NodeId) -> Vec<(NodeId, Relation, Vec3)> {
+    let nbrs = graph.neighborhood(c);
+    let n = nbrs.len().max(1);
+    let phase = c as f32 * 1.30219; // stable per-node rotation
+    nbrs.iter()
+        .enumerate()
+        .map(|(k, nb)| {
+            let ang = phase + k as f32 / n as f32 * std::f32::consts::TAU;
+            let z = (k as f32 * 0.7).sin() * 0.5;
+            let pos = Vec3::new(
+                ang.cos() * config::LOCAL_LAYOUT_RADIUS,
+                ang.sin() * config::LOCAL_LAYOUT_RADIUS,
+                z,
+            );
+            (nb.id, nb.rel, pos)
+        })
+        .collect()
+}
+
+// --- emit primitives -----------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn push_node(
+    f: &mut Frame,
+    graph: &Graph,
+    id: NodeId,
+    center: Vec3,
+    radius: f32,
+    alpha: f32,
+    evert: f32,
+    focus: f32,
+    time: f32,
+    readout: bool,
+) {
+    if alpha <= 0.01 {
+        return;
+    }
+    let node = graph.node(id);
+    let tint = node.kind.tint();
+    let glow = node.kind.glow();
+    f.nodes.push(Instance::node(
+        center,
+        radius,
+        tint,
+        alpha,
+        evert,
+        focus,
+        glow,
+        time * 0.15,
+    ));
+
+    if readout {
+        f.rings
+            .push(RingInstance::new(center, radius, tint, node.bits, alpha));
+        f.labels.push(Label {
+            text: format!("{}  ·  {}", node.name, node.kind.name()),
+            pos: center + Vec3::Y * (radius * 1.2),
+            rgb: [tint.x, tint.y, tint.z],
+            alpha,
+        });
+    }
+}
+
+fn push_edge(f: &mut Frame, es: &EdgeSpec, glow: f32, alpha: f32) {
+    let width = config::EDGE_WIDTH * if es.rel.is_ownership() { 1.5 } else { 1.0 };
+    f.edges
+        .push(EdgeInstance::new(es.a, es.b, width, glow, es.rel.color(), alpha));
+}
+
+fn center_label(graph: &Graph, c: NodeId) -> Label {
+    let node = graph.node(c);
+    let tint = node.kind.tint();
+    Label {
+        text: format!("▸ {}  ({})", node.name, node.kind.name()),
+        pos: Vec3::ZERO,
+        rgb: [tint.x, tint.y, tint.z],
+        alpha: 0.8,
+    }
+}
+
+fn edge_glow(rel: Relation, hovered: bool) -> f32 {
+    let mut g = config::EDGE_GLOW;
+    if rel.is_ownership() {
+        g *= config::EDGE_OWNS_BOOST;
+    }
+    if hovered {
+        g *= config::EDGE_HOVER_BOOST;
+    }
+    g
+}
+
+// --- picking -------------------------------------------------------------
+
+fn pick_placement(placements: &[Placement], o: Vec3, d: Vec3) -> Option<NodeId> {
+    let mut best: Option<(f32, NodeId)> = None;
+    for p in placements {
+        if let Some(t) = ray_sphere(o, d, p.pos, p.radius * 1.1) {
             if best.map_or(true, |(bt, _)| t < bt) {
-                best = Some((t, c.index));
+                best = Some((t, p.id));
             }
         }
     }
-    best.map(|(_, i)| i)
+    best.map(|(_, id)| id)
 }
 
-/// Nearest positive ray-sphere hit distance, if any.
 fn ray_sphere(o: Vec3, d: Vec3, center: Vec3, radius: f32) -> Option<f32> {
     let oc = o - center;
     let b = oc.dot(d);
@@ -218,21 +314,8 @@ fn ray_sphere(o: Vec3, d: Vec3, center: Vec3, radius: f32) -> Option<f32> {
     }
 }
 
-/// 1.0 when the cursor ray points straight at the sphere, falling off within a
-/// few degrees — the "looking at it" clarity affordance.
-fn hover_focus(o: Vec3, d: Vec3, center: Vec3, radius: f32) -> f32 {
-    let to = center - o;
-    let dist = to.length().max(0.0001);
-    let cosang = (to / dist).dot(d).clamp(-1.0, 1.0);
-    // Angular radius the sphere subtends, plus a little slack.
-    let subtend = (radius / dist).atan();
-    let ang = cosang.acos();
-    // 1.0 when the ray is inside the sphere's silhouette, fading out beyond it.
-    1.0 - smoothstep(ang, subtend * 0.6, subtend * 2.2)
-}
-
-fn smoothstep(x: f32, edge0: f32, edge1: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+fn smoothstep(x: f32, e0: f32, e1: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 

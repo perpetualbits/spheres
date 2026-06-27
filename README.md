@@ -1,23 +1,16 @@
-# Spheres — Phase 0.5
+# Spheres — Phase 0.6
 
 A standalone [wgpu](https://wgpu.rs/) + [winit](https://github.com/rust-windowing/winit)
-prototype of the **recursive** sphere desktop. Glassy dark spheres hang in
-space, each one previewing the little world inside it. Click a sphere and it
-**everts and envelops you** — you arrive inside it, in a new space of child
-spheres, each enterable the same way, to any depth. Esc surfaces you back out
-one level.
+prototype of the spatial/relational interface. NOT a compositor. This phase
+hand-authors a real **graph** of the "eno" project and makes its *structure* a
+place you can be inside of — revealing relationships a file tree hides: `core`'s
+centrality, the hidden `carve`/`glint` cross-couplings, and one person spanning
+libraries and tools at once.
 
-This is **not** a compositor. No Smithay, no Wayland plumbing, no real apps. It
-exists to answer the two questions Phase 0.5 gates (see `docs/DESIGN.md`):
-
-1. *Does the recursion feel coherent* — does "everything is a sphere, entering
-   is everting" hold up nested several levels deep?
-2. *Is the world legible and navigable* — can you tell N featureless spheres
-   apart, and is getting back out rock-solid so you never get lost?
-
-The frame-time HUD from Phase 0 is retained: the eversion is still the
-worst-case frame, and the scene is now heavy (glass overdraw + many spheres),
-so this is the realistic worst case to watch.
+Every node is a glassy sphere (a container you evert into) wearing a **Saturn
+ring** that reads out its data. Nodes are linked by glowing **edges**, so the
+whole graph is visible at a glance. Crucially, nodes are keyed by a **stable
+id**: reaching one two ways lands you in the *same* world.
 
 ## Run
 
@@ -25,90 +18,109 @@ so this is the realistic worst case to watch.
 cargo run --release
 ```
 
-(`--release` matters for representative frame times.)
-
-For adapter / device logging: `RUST_LOG=info cargo run --release`.
+`RUST_LOG=info cargo run --release` logs the adapter.
 
 ## Controls
 
 | Input | Action |
 |---|---|
-| **Left click** | Evert into the sphere under the cursor |
-| **Right click** or **Esc** | Surface out one level (reliable from any state) |
+| **Left click** | Evert into the node under the cursor |
+| **Right click** / **Esc** | Surface out one level (reliable from any state) |
 | **Q** / window close | Quit |
 
-Pointing at a sphere clears its glass (the "invites entry" affordance).
-Triggering a gesture mid-animation just reverses it — Esc always takes you
-*up*, from resting or mid-dive, so the way out is always available.
+Point at a node to **browse** it: its glass clears and its relation edges
+brighten (peek before you commit). Everting **enters** the node's world, where
+its neighbours surround you.
 
 ## What you are looking at
 
-- **Glassy dark spheres.** Blackish translucent glass with a coloured fresnel
-  rim. You see *through* them to the bright **preview cores** inside — miniatures
-  of that sphere's actual children, at their real relative positions. A sphere
-  literally previews the world you would enter.
-- **Distinct at a glance.** Each sphere in a world has its own hue (by index, so
-  siblings always differ), a faint surface pattern, and 1–3 orbiting moons.
-- **Recursion.** Entering a sphere drops you into a fresh world of its children.
-  Worlds are generated deterministically from the path, so positions are
-  **stable** — leave and come back and everything is where you left it (spatial
-  memory). Depth is unbounded.
-- **Breadcrumb.** Bottom-left, always on: `depth: 2   Root > Amber > Azure`, so
-  you always know where you are and how you got there.
+- **The overview (depth 0).** The whole graph, pulled back. `core` sits at the
+  centre with five libraries' `depends-on` edges converging on it (it is also
+  the largest, scaled by degree). Production fans `uses` edges down from the
+  top; tools sit to the sides, each throwing a link into two worlds; people
+  float in a front shell, their `owns` edges (brightest) raking across the
+  library/tool boundary — **Roland** owns `core`, `crest`, `carve`, `glint`,
+  the edge a file tree cannot show.
+- **A node's world.** Evert into a node and its neighbours lay out around you,
+  edges radiating from the centre, each named (`depends-on`, `uses`, `owns`…).
+- **Kind legibility.** Production = amber, library = blue, tool = green,
+  person = magenta (and people glow brightest — materially "present").
+- **Ring readouts.** Each sphere's tilted ring shows up to four glowing-square
+  markers, **derived from the graph**: owned · depends-on-core · hub
+  (in-degree ≥ 3) · cross-cutting (touches ≥ 3 kinds). Name + kind ride as a
+  billboarded label.
+- **Convergence.** Enter `core` from `crest`, from `io`, from production — the
+  same world every time (same neighbours, same positions). The breadcrumb
+  trail differs; the place does not.
+
+## The graph (`src/graph.rs`)
+
+Nodes by kind:
+
+| kind | nodes |
+|---|---|
+| production | `desert-monument` |
+| library | `crest`, `siftr`, `fx`, `gfx`, `io`, `core` |
+| tool | `carve`, `glint`, `smolr` |
+| person | `Roland`, `Simon`, `Elise`, `Segher` |
+
+Edges (directed, named):
+
+```
+desert-monument  --uses-->        crest, siftr, fx, gfx, core, io
+desert-monument  --packed-by-->   smolr
+crest,siftr,fx,gfx,io --depend-on--> core
+siftr            --feeds-->       fx
+carve            --authors-for--> crest, desert-monument
+glint            --shaders-for--> gfx, desert-monument
+Roland           --owns-->        core, crest, carve, glint
+Simon            --owns-->        siftr, fx
+Elise            --feeds-->       io, siftr
+Segher           --owns-->        smolr
+```
 
 ## The HUD
 
-Top-left, always on (unchanged from Phase 0):
-
-- **frame** / **fps** — last frame time and frame rate.
-- **max (3s)** — rolling maximum frame time, so a brief spike does not scroll
-  away before you see it.
-- **budget** — the target; the readout turns **red** on any frame over it.
-- **eversion (last) / EVERSION (live)** — frames that blew the budget during the
-  most recent eversion. The eversion in a populated scene is the worst-case
-  frame, so this is the headline number.
-
-Frame time is measured vsync-off (`PresentMode::AutoNoVsync`) so the number
-reflects real work, not the present-block.
+Top-left, always on: frame time / fps, rolling 3s max, the budget (red on any
+over-budget frame), and the per-eversion over-budget count. Bottom-left: the
+`depth: N   overview > … ` breadcrumb. Measured vsync-off so spikes show.
 
 ## Debug / headless helpers (env vars)
 
 | Variable | Effect |
 |---|---|
-| `SPHERES_AUTODEMO=1` | Dive and surface on a timer (no mouse) — for hands-free viewing / capture. |
-| `SPHERES_PERFLOG=1` | Log frame stats to stderr periodically (the HUD numbers, without reading the window). |
-| `SPHERES_CAPTURE=path` | Render a few scripted frames to `path.root.ppm`, `path.inside.ppm`, `path.evert.ppm` and exit — a compositor-independent way to see what the GPU drew. |
+| `SPHERES_AUTODEMO=1` | Walk overview → production → core and back, on a timer. |
+| `SPHERES_PERFLOG=1` | Log frame stats to stderr periodically. |
+| `SPHERES_CAPTURE=path` | Render scripted frames (`overview`, `production`, `core-via-production`, `core-via-io`, `evert`) to `path.*.ppm` and exit. The two `core-*` frames are byte-identical — convergence, made visible. |
 
-## Constants to tune
-
-All tunables live in [`src/config.rs`]. The ones you will reach for first:
+## Constants to tune (`src/config.rs`)
 
 | Constant | Meaning |
 |---|---|
-| `EVERSION_DURATION_MS` | Length of the gesture (default 420 ms; keep it 300–500, fast and decisive). |
-| `FRAME_BUDGET_MS` | The deadline the HUD highlights against (default 16.6 = 60 Hz). |
-| `SPHERES_PER_LEVEL` | Child spheres per world (default 8). |
-| `CAMERA_REST_DIST` | How far back the resting camera sits. |
-| `LAYOUT_RADIUS` / `CHILD_RADIUS` | World layout spread and sphere size. |
-| `ENVELOP_RADIUS` | How large the target grows to swallow you. |
-| `GLASS_OPACITY_CENTER` / `GLASS_OPACITY_EDGE` | Glass transparency face-on vs at the rim. |
-| `GLASS_FRESNEL_POWER` / `GLASS_REFRACTION` | Rim falloff and cosmetic shimmer. |
-| `GLASS_FOCUS_CLARITY` | How much pointing at a sphere clears its glass. |
-| `GLASS_INNER_BOOST` | Brightening of the inner surface once you are enclosed. |
-| `PREVIEW_CORE_COUNT` / `PREVIEW_FILL` | The inner-world preview inside each sphere. |
-| `SPHERE_RINGS` / `SPHERE_SEGMENTS` | Tessellation — lower these if the iGPU struggles. |
+| `EVERSION_DURATION_MS` | Gesture length (default 440 ms). |
+| `FRAME_BUDGET_MS` | HUD deadline (16.6 = 60 Hz). |
+| `OVERVIEW_DIST` / `LOCAL_DIST` | Camera distance pulled-back vs inside a node. |
+| `TINT_*` / `GLOW_*` | Per-kind material and self-glow. |
+| `RING_*` | Ring size, tilt, marker count, glow. |
+| `EDGE_WIDTH` / `EDGE_GLOW` / `EDGE_OWNS_BOOST` / `EDGE_HOVER_BOOST` | Link look and emphasis. |
+| `NODE_BASE_RADIUS` / `NODE_DEGREE_SCALE` | Node size and how much the hub grows. |
+| `GLASS_*` | Glass transparency, fresnel, browse-clarity. |
+| `SPHERE_RINGS` / `SPHERE_SEGMENTS` | Tessellation. |
 
 ## Module map
 
 | File | Responsibility |
 |---|---|
-| `src/main.rs` | Window, event loop, input, cursor, per-frame timing, capture. |
-| `src/config.rs` | All tunable constants. |
-| `src/world.rs` | The deterministic nested-world model (spheres, palette, RNG). |
-| `src/nav.rs` | The navigation state machine (path + transitions, Esc reliability). |
-| `src/scene.rs` | Per-frame instance assembly, preview cores/moons, ray-picking. |
-| `src/camera.rs` | Camera pose, eversion bob, ray unprojection for picking. |
-| `src/eversion.rs` | The eased progress scalar driving a gesture. |
-| `src/render.rs` | wgpu setup, the opaque + glass pipelines, instancing, the draw. |
-| `src/hud.rs` | Frame-time stats + breadcrumb, via glyphon. |
-| `src/shader.wgsl` | Instanced eversion deformation + glass / solid shading. |
+| `src/graph.rs` | The hard-coded "eno" graph: nodes (id, kind, form, pos, ring bits), typed edges, neighbourhood queries. |
+| `src/nav.rs` | Id-keyed navigation: trail, transitions, convergence, ambient tint, camera distance. |
+| `src/scene.rs` | Per-frame assembly of node / ring / edge instances + labels; picking. |
+| `src/render.rs` | wgpu: depth pre-pass, glass, ring, and edge pipelines; capture. |
+| `src/hud.rs` | Stats, breadcrumb, billboarded world-space labels. |
+| `src/camera.rs`, `src/eversion.rs`, `src/sphere.rs` | Camera, the eased gesture scalar, the sphere mesh. |
+| `src/shader.wgsl` | Sphere (glass) + ring + edge programs. |
+
+## Deferred (TODO in code)
+
+Scroll/book leaf forms for individual files (this phase stays at the node-graph
+level); any "act"/queue mode; running the actual demo; a config setting for the
+default landing point (hardcoded production-first for now).

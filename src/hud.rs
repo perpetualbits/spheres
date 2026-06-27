@@ -1,16 +1,12 @@
-//! Frame-time HUD.
+//! HUD: frame-time stats, breadcrumb, and billboarded world-space labels.
 //!
-//! Always-on instrumentation, required from day one: current frame time and
-//! FPS, the rolling MAX frame time over the last few seconds, a red highlight
-//! whenever a frame blows the budget, and — the thing we actually care about —
-//! a persistent count of how many frames blew the budget during the *last
-//! eversion*, since the eversion is our worst-case frame.
-//!
-//! Text is rendered with glyphon (cosmic-text + a wgpu glyph atlas).
+//! Text is rendered with glyphon. Node labels are projected from their world
+//! position to screen each frame so names/kinds ride with the spheres.
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use glam::{Mat4, Vec3, Vec4};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -18,18 +14,21 @@ use glyphon::{
 
 use crate::config;
 
+/// A billboarded world-space label (a node name/kind).
+pub struct Label {
+    pub text: String,
+    pub pos: Vec3,
+    pub rgb: [f32; 3],
+    pub alpha: f32,
+}
+
 /// Rolling frame-time statistics plus the eversion budget monitor.
 struct Stats {
-    /// (timestamp, frame_ms) within the rolling window.
     samples: VecDeque<(Instant, f32)>,
     last_ms: f32,
     fps: f32,
-
-    // Eversion worst-case monitoring.
     prev_eversion_active: bool,
-    /// Over-budget frames in the eversion currently in flight.
     live_over: u32,
-    /// Over-budget frames from the most recently completed eversion.
     last_over: u32,
     eversion_active: bool,
 }
@@ -49,7 +48,6 @@ impl Stats {
 
     fn record(&mut self, now: Instant, frame_ms: f32, eversion_active: bool) {
         self.last_ms = frame_ms;
-        // Smooth FPS a little so the readout is legible.
         let inst_fps = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
         self.fps = if self.fps == 0.0 {
             inst_fps
@@ -67,27 +65,21 @@ impl Stats {
             }
         }
 
-        // Eversion budget monitor.
         self.eversion_active = eversion_active;
         if eversion_active && !self.prev_eversion_active {
-            // A fresh eversion just started.
             self.live_over = 0;
         }
         if eversion_active && frame_ms > config::FRAME_BUDGET_MS {
             self.live_over += 1;
         }
         if !eversion_active && self.prev_eversion_active {
-            // The eversion just finished; freeze the count.
             self.last_over = self.live_over;
         }
         self.prev_eversion_active = eversion_active;
     }
 
     fn rolling_max(&self) -> f32 {
-        self.samples
-            .iter()
-            .map(|&(_, ms)| ms)
-            .fold(0.0_f32, f32::max)
+        self.samples.iter().map(|&(_, ms)| ms).fold(0.0_f32, f32::max)
     }
 
     fn over_budget(&self) -> bool {
@@ -103,14 +95,17 @@ pub struct Hud {
     renderer: TextRenderer,
     buffer: Buffer,
     crumb_buffer: Buffer,
+    label_pool: Vec<Buffer>,
 
     width: u32,
     height: u32,
     stats: Stats,
 
-    /// Current navigation depth and breadcrumb trail, set each frame.
     depth: usize,
     breadcrumb: String,
+
+    labels: Vec<Label>,
+    view_proj: Mat4,
 }
 
 impl Hud {
@@ -142,11 +137,14 @@ impl Hud {
             renderer,
             buffer,
             crumb_buffer,
+            label_pool: Vec::new(),
             width,
             height,
             stats: Stats::new(),
             depth: 0,
-            breadcrumb: String::from("Root"),
+            breadcrumb: String::from("overview"),
+            labels: Vec::new(),
+            view_proj: Mat4::IDENTITY,
         }
     }
 
@@ -159,25 +157,25 @@ impl Hud {
             .set_size(&mut self.font_system, Some(width as f32), Some(height as f32));
     }
 
-    /// Set the navigation depth + breadcrumb trail for this frame's readout.
     pub fn set_nav(&mut self, depth: usize, breadcrumb: String) {
         self.depth = depth;
         self.breadcrumb = breadcrumb;
     }
 
-    /// Record this frame's timing. `eversion_active` is true while the gesture
-    /// is mid-flight.
+    /// Provide this frame's world-space labels and the matrix to project them.
+    pub fn set_world_labels(&mut self, labels: Vec<Label>, view_proj: Mat4) {
+        self.labels = labels;
+        self.view_proj = view_proj;
+    }
+
     pub fn record(&mut self, now: Instant, frame_ms: f32, eversion_active: bool) {
         self.stats.record(now, frame_ms, eversion_active);
     }
 
-    /// (last_ms, fps, rolling_max_ms) — for optional headless perf logging.
     pub fn snapshot(&self) -> (f32, f32, f32) {
         (self.stats.last_ms, self.stats.fps, self.stats.rolling_max())
     }
 
-    /// Build the HUD text and upload glyphs. Call once per frame, before the
-    /// render pass.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -185,14 +183,10 @@ impl Hud {
     ) -> Result<(), glyphon::PrepareError> {
         let s = &self.stats;
         let eversion_line = if s.eversion_active {
-            format!(
-                "EVERSION (live): {} frames > budget",
-                s.live_over
-            )
+            format!("EVERSION (live): {} frames > budget", s.live_over)
         } else {
             format!("eversion (last): {} frames > budget", s.last_over)
         };
-
         let text = format!(
             "frame: {:.2} ms   fps: {:.0}\nmax ({:.0}s): {:.2} ms   budget: {:.1} ms\n{}",
             s.last_ms,
@@ -202,19 +196,34 @@ impl Hud {
             config::FRAME_BUDGET_MS,
             eversion_line,
         );
-
-        let attrs = Attrs::new().family(Family::Monospace);
-        self.buffer
-            .set_text(&mut self.font_system, &text, &attrs, Shaping::Advanced, None);
-        self.buffer
-            .shape_until_scroll(&mut self.font_system, false);
-
-        // Breadcrumb / depth trail — navigation must always be visible.
         let crumb = format!("depth: {}   {}", self.depth, self.breadcrumb);
+
+        let mono = Attrs::new().family(Family::Monospace);
+        self.buffer
+            .set_text(&mut self.font_system, &text, &mono, Shaping::Advanced, None);
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
         self.crumb_buffer
-            .set_text(&mut self.font_system, &crumb, &attrs, Shaping::Advanced, None);
+            .set_text(&mut self.font_system, &crumb, &mono, Shaping::Advanced, None);
         self.crumb_buffer
             .shape_until_scroll(&mut self.font_system, false);
+
+        // Grow the label buffer pool to match this frame's labels.
+        while self.label_pool.len() < self.labels.len() {
+            let mut b = Buffer::new(&mut self.font_system, Metrics::new(15.0, 18.0));
+            b.set_size(&mut self.font_system, Some(self.width as f32), Some(self.height as f32));
+            self.label_pool.push(b);
+        }
+        let sans = Attrs::new().family(Family::SansSerif);
+        for (i, label) in self.labels.iter().enumerate() {
+            self.label_pool[i].set_text(
+                &mut self.font_system,
+                &label.text,
+                &sans,
+                Shaping::Advanced,
+                None,
+            );
+            self.label_pool[i].shape_until_scroll(&mut self.font_system, false);
+        }
 
         self.viewport.update(
             queue,
@@ -224,13 +233,11 @@ impl Hud {
             },
         );
 
-        // Red when the last frame blew the budget, otherwise a calm green.
-        let color = if s.over_budget() {
+        let stats_color = if s.over_budget() {
             Color::rgb(255, 70, 70)
         } else {
             Color::rgb(120, 230, 140)
         };
-
         let full_bounds = TextBounds {
             left: 0,
             top: 0,
@@ -238,25 +245,55 @@ impl Hud {
             bottom: self.height as i32,
         };
 
-        let stats_area = TextArea {
-            buffer: &self.buffer,
-            left: 12.0,
-            top: 12.0,
-            scale: 1.0,
-            bounds: full_bounds,
-            default_color: color,
-            custom_glyphs: &[],
-        };
+        let mut areas = vec![
+            TextArea {
+                buffer: &self.buffer,
+                left: 12.0,
+                top: 12.0,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: stats_color,
+                custom_glyphs: &[],
+            },
+            TextArea {
+                buffer: &self.crumb_buffer,
+                left: 12.0,
+                top: (self.height as f32 - 36.0).max(0.0),
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: Color::rgb(150, 210, 255),
+                custom_glyphs: &[],
+            },
+        ];
 
-        let crumb_area = TextArea {
-            buffer: &self.crumb_buffer,
-            left: 12.0,
-            top: (self.height as f32 - 36.0).max(0.0),
-            scale: 1.0,
-            bounds: full_bounds,
-            default_color: Color::rgb(150, 210, 255),
-            custom_glyphs: &[],
-        };
+        // Project each world-space label to screen.
+        for (i, label) in self.labels.iter().enumerate() {
+            let clip = self.view_proj * Vec4::new(label.pos.x, label.pos.y, label.pos.z, 1.0);
+            if clip.w <= 0.0001 {
+                continue; // behind the camera
+            }
+            let ndc = clip.truncate() / clip.w;
+            if ndc.x < -1.3 || ndc.x > 1.3 || ndc.y < -1.3 || ndc.y > 1.3 {
+                continue; // well off-screen
+            }
+            let sx = (ndc.x * 0.5 + 0.5) * self.width as f32;
+            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * self.height as f32;
+            let a = (label.alpha.clamp(0.0, 1.0) * 255.0) as u8;
+            areas.push(TextArea {
+                buffer: &self.label_pool[i],
+                left: sx - 28.0,
+                top: sy,
+                scale: 1.0,
+                bounds: full_bounds,
+                default_color: Color::rgba(
+                    (label.rgb[0] * 255.0) as u8,
+                    (label.rgb[1] * 255.0) as u8,
+                    (label.rgb[2] * 255.0) as u8,
+                    a,
+                ),
+                custom_glyphs: &[],
+            });
+        }
 
         self.renderer.prepare(
             device,
@@ -264,13 +301,15 @@ impl Hud {
             &mut self.font_system,
             &mut self.atlas,
             &self.viewport,
-            [stats_area, crumb_area],
+            areas,
             &mut self.swash_cache,
         )
     }
 
-    /// Draw the prepared text into an existing render pass.
-    pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) -> Result<(), glyphon::RenderError> {
+    pub fn render<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+    ) -> Result<(), glyphon::RenderError> {
         self.renderer.render(&self.atlas, &self.viewport, pass)
     }
 }
